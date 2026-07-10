@@ -105,8 +105,13 @@ static const int      PWM_FREQ_HZ   = 20000;  // 20 kHz -> inaudible
 static const int      PWM_RES_BITS  = 8;      // 0..255
 static const int      RUN_DUTY      = 255;    // motor speed while running (0..255)
 
-// Debounce lockout so one make+break of the NO switch = one count.
-static const uint32_t SW_LOCKOUT_MS = 30;
+// Debounce: a candidate edge (flagged by the ISR) is only counted once the
+// pin has held LOW continuously for SW_CONFIRM_MS, and the next candidate
+// isn't armed until the pin is back HIGH for SW_CONFIRM_MS. This rejects the
+// microsecond-scale glitches coming off the PWM-driven motor (~50us period
+// at 20kHz) regardless of when they occur, since a real switch closure dwells
+// for many milliseconds at this winding speed but a noise glitch does not.
+static const uint32_t SW_CONFIRM_MS = 10;
 
 // ============================================================
 //  Shared state
@@ -117,17 +122,52 @@ static volatile WinderState state = ST_IDLE;
 static volatile uint32_t wrapCount     = 0;
 static uint32_t          targetCount   = 100;
 
-static volatile uint32_t lastEdgeMs    = 0;   // for ISR debounce
+// ============================================================
+//  Limit-switch ISR — only flags a candidate edge, nothing else
+// ============================================================
+static volatile bool     candidatePending = false;
+static volatile uint32_t candidateMs      = 0;
+
+void IRAM_ATTR onLimitSwitch() {
+  candidatePending = true;
+  candidateMs = millis();
+}
 
 // ============================================================
-//  Limit-switch ISR — only touches the counter, nothing else
+//  Limit-switch debounce — confirms a candidate edge from loop().
+//  See SW_CONFIRM_MS above for why this rejects noise.
 // ============================================================
-void IRAM_ATTR onLimitSwitch() {
-  uint32_t now = millis();
-  if (now - lastEdgeMs < SW_LOCKOUT_MS) return;   // ignore contact bounce / break
-  lastEdgeMs = now;
-  if (state == ST_RUNNING) {
-    wrapCount++;
+static bool     awaitingConfirm = false;
+static bool     awaitingRelease = false;
+static uint32_t confirmStartMs  = 0;
+static uint32_t releaseStartMs  = 0;
+
+static void pollLimitSwitch() {
+  if (candidatePending && !awaitingConfirm && !awaitingRelease) {
+    noInterrupts();
+    candidatePending = false;
+    confirmStartMs = candidateMs;
+    interrupts();
+    awaitingConfirm = true;
+  }
+
+  if (awaitingConfirm) {
+    if (digitalRead(LIMIT_SW_PIN) == HIGH) {
+      awaitingConfirm = false;                 // reverted before confirming -> noise, discard
+    } else if (millis() - confirmStartMs >= SW_CONFIRM_MS) {
+      if (state == ST_RUNNING) wrapCount++;    // held LOW long enough -> real closure
+      awaitingConfirm = false;
+      awaitingRelease  = true;
+      releaseStartMs   = millis();
+    }
+  }
+
+  if (awaitingRelease) {
+    if (digitalRead(LIMIT_SW_PIN) == LOW) {
+      releaseStartMs = millis();               // still closed, keep waiting for release
+    } else if (millis() - releaseStartMs >= SW_CONFIRM_MS) {
+      awaitingRelease = false;                 // back open and stable -> ready for next candidate
+    }
   }
 }
 
@@ -174,6 +214,13 @@ static lv_obj_t *lblTarget;    // target readout in the setter row
 static lv_obj_t *lblState;     // state text
 static lv_obj_t *btnStart;
 static lv_obj_t *btnPause;
+
+static lv_obj_t *keypadPopup;  // NULL when not open
+static lv_obj_t *keypadTa;
+
+// Max target the keypad will accept — keeps wrapCount/targetCount display
+// and math comfortably within the wide integer types used for them.
+static const uint32_t TARGET_MAX = 999999UL;
 
 static void refreshLabels() {
   static char cbuf[24];
@@ -234,6 +281,59 @@ static void onTargetPlus(lv_event_t *e) {
   refreshLabels();
 }
 
+// --- Numeric keypad popup (tap the target readout to enter an exact value) --
+static void closeKeypad() {
+  if (keypadPopup) {
+    lv_obj_del(keypadPopup);
+    keypadPopup = NULL;
+  }
+}
+
+static void onKeypadEvent(lv_event_t *e) {
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_READY) {
+    const char *txt = lv_textarea_get_text(keypadTa);
+    uint32_t v = (uint32_t)strtoul(txt, NULL, 10);
+    if (v > TARGET_MAX) v = TARGET_MAX;
+    targetCount = v;
+    refreshLabels();
+    closeKeypad();
+  } else if (code == LV_EVENT_CANCEL) {
+    closeKeypad();
+  }
+}
+
+static void onTargetLabelClicked(lv_event_t *e) {
+  if (state == ST_RUNNING) return;   // target locked while running, same as +/-
+  if (keypadPopup) return;           // already open
+
+  keypadPopup = lv_obj_create(lv_scr_act());
+  lv_obj_remove_style_all(keypadPopup);
+  lv_obj_set_size(keypadPopup, SCR_W, SCR_H);
+  lv_obj_center(keypadPopup);
+  lv_obj_set_style_bg_color(keypadPopup, lv_color_hex(0x101418), 0);
+  lv_obj_set_style_bg_opa(keypadPopup, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(keypadPopup, LV_OBJ_FLAG_SCROLLABLE);
+
+  keypadTa = lv_textarea_create(keypadPopup);
+  lv_textarea_set_one_line(keypadTa, true);
+  lv_textarea_set_accepted_chars(keypadTa, "0123456789");
+  lv_textarea_set_max_length(keypadTa, 6);
+  lv_obj_set_size(keypadTa, 150, 32);
+  lv_obj_align(keypadTa, LV_ALIGN_TOP_MID, 0, 8);
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)targetCount);
+  lv_textarea_set_text(keypadTa, buf);
+
+  lv_obj_t *kb = lv_keyboard_create(keypadPopup);
+  lv_keyboard_set_mode(kb, LV_KEYBOARD_MODE_NUMBER);
+  lv_keyboard_set_textarea(kb, keypadTa);
+  lv_obj_set_size(kb, SCR_W - 8, SCR_H - 48);
+  lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -4);
+  lv_obj_add_event_cb(kb, onKeypadEvent, LV_EVENT_READY, NULL);
+  lv_obj_add_event_cb(kb, onKeypadEvent, LV_EVENT_CANCEL, NULL);
+}
+
 // --- Build the screen -------------------------------------------------
 static lv_obj_t *makeBtn(lv_obj_t *parent, const char *txt,
                          lv_align_t align, lv_coord_t ox, lv_coord_t oy,
@@ -273,9 +373,16 @@ static void buildUI() {
   lv_obj_align(lblState, LV_ALIGN_TOP_MID, 0, 74);
 
   // Target setter row:  [ - ]  Target: N  [ + ]
+  // The label itself is tappable -- opens a numeric keypad for exact entry.
   lblTarget = lv_label_create(scr);
   lv_obj_set_style_text_color(lblTarget, lv_color_hex(0xcfd8e0), 0);
+  lv_obj_set_style_pad_all(lblTarget, 6, 0);
+  lv_obj_set_style_bg_opa(lblTarget, LV_OPA_20, 0);
+  lv_obj_set_style_bg_color(lblTarget, lv_color_hex(0x8fd6ff), 0);
+  lv_obj_set_style_radius(lblTarget, 6, 0);
   lv_obj_align(lblTarget, LV_ALIGN_CENTER, 0, 2);
+  lv_obj_add_flag(lblTarget, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(lblTarget, onTargetLabelClicked, LV_EVENT_CLICKED, NULL);
 
   makeBtn(scr, "-", LV_ALIGN_CENTER, -78, 2, 40, 40,
           onTargetMinus, lv_color_hex(0x37414b));
@@ -334,8 +441,11 @@ void setup() {
 }
 
 void loop() {
-  // Control logic in the main loop (ISR only counts).
+  // Control logic in the main loop (ISR only flags candidate edges;
+  // pollLimitSwitch() confirms/counts them here).
   static uint32_t lastShown = 0xFFFFFFFF;
+
+  pollLimitSwitch();
 
   if (state == ST_RUNNING && wrapCount >= targetCount) {
     motorStop();

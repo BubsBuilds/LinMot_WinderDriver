@@ -45,10 +45,18 @@ flyback/snubber belongs on the motor side.
   folder outside `src/` and swap them in only when actually flashing them.
 
 ## Design rules (please preserve)
-- **ISR does one thing:** the limit-switch interrupt only increments a
-  `volatile` wrap counter, with a ~30 ms debounce lockout (`SW_LOCKOUT_MS`) so
-  one make-then-break doesn't double-count. Do **not** add motor control, LVGL
-  calls, or blocking work inside the ISR.
+- **ISR does one thing:** the limit-switch interrupt only flags a candidate
+  edge (`candidatePending` + timestamp) — it does **not** touch the wrap
+  counter directly. `pollLimitSwitch()`, called from `loop()`, confirms a
+  candidate only after the pin holds LOW continuously for `SW_CONFIRM_MS`,
+  and only re-arms after it's back HIGH for `SW_CONFIRM_MS`. This replaced an
+  earlier simpler design (ISR incremented the counter directly, gated by a
+  time-since-last-edge lockout) after real hardware showed spurious counts
+  from PWM-driven motor noise occurring well away from actual switch
+  transitions — a pure post-edge lockout can't reject noise that arrives
+  after the lockout window expires, but a stable-dwell confirm rejects any
+  glitch shorter than `SW_CONFIRM_MS` regardless of timing. Do **not** add
+  motor control, LVGL calls, or blocking work inside the ISR.
 - **All control/UI logic lives in `loop()`.** This keeps `lv_timer_handler()`
   responsive.
 - **State machine:** `ST_IDLE → ST_RUNNING → ST_PAUSED → ST_DONE`.
@@ -79,15 +87,37 @@ flyback/snubber belongs on the motor side.
    `setRotation(0)` are correct as configured; colors and orientation are right
    on real hardware. (The backlight pin was wrong, see Pin map — that's what
    caused an all-black screen, not orientation/inversion.)
-3. **Possible enhancements (not yet built):** numeric keypad for exact target
-   entry, persistent target across power cycles (NVS/Preferences), ramp-down
-   near target.
+3. ~~Numeric keypad for exact target entry~~ — **built.** Tapping the
+   `lblTarget` readout (now clickable, with a tinted background as a tap
+   affordance) opens a full-screen `lv_keyboard` (`LV_KEYBOARD_MODE_NUMBER`)
+   bound to a textarea pre-filled with the current target. `LV_EVENT_READY`
+   (the keyboard's checkmark) commits the typed value (clamped to
+   `TARGET_MAX`); `LV_EVENT_CANCEL` (the X) discards it. Locked while running,
+   same rule as the ± buttons. **Not yet re-verified on real hardware** — the
+   round 240x240 panel is tight for the default keyboard layout; check button
+   hit targets aren't clipped/overlapping before relying on it.
+   **Still not built:** persistent target across power cycles
+   (NVS/Preferences), ramp-down near target.
 4. **Base operation confirmed working** on real hardware (display, touch,
    motor, wrap counting) as of this writing. `RUN_DUTY` has been raised to
    255 (full speed) from the original 200 default.
+5. **Wrap counter over-counting (2+ per rotation), confirmed on real
+   hardware.** First attempt (bumping the old time-since-last-edge
+   `SW_LOCKOUT_MS` from 30ms to 100ms) didn't fully fix it — counts were
+   still appearing well away from any real switch transition, pointing to
+   continuous electrical noise from the PWM-driven motor (sharing ground,
+   ~50us period at 20kHz) rather than plain contact bounce clustered right
+   after real edges. Replaced with a stable-dwell confirm/release scheme
+   (see Design rules above): `SW_LOCKOUT_MS` → `SW_CONFIRM_MS`, and counting
+   moved from the ISR into `pollLimitSwitch()` in `loop()`. **Not yet
+   re-verified on hardware as of this writing** — if noise still leaks
+   through, the fallback is a hardware RC filter (e.g. 100nF cap
+   GPIO17→GND, possibly with an external pull-up) at the switch.
 
 ## Tuning knobs
 - `RUN_DUTY` (0–255) — winding speed
-- `SW_LOCKOUT_MS` (default 30) — debounce window; lower it only if spinning
-  faster than ~2000 RPM and counts are missed
+- `SW_CONFIRM_MS` (default 10; replaced `SW_LOCKOUT_MS` — see Known open
+  items) — required stable dwell (low-to-confirm, high-to-rearm) in ms;
+  raise it if noise still leaks through, lower it only if genuine wraps
+  start being missed at this winding speed (<300 RPM)
 - `PWM_FREQ_HZ` (20 kHz) — kept above audible range
